@@ -1,114 +1,136 @@
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-import logging
 import json
+import logging
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.exceptions import AirflowException
 
 log = logging.getLogger("airflow.task")
-
 CONFIG_PATH = "/opt/airflow/config/api_config.json"
 
 
 def load_config():
-    """Load configuration from the file path."""
+    """Load configuration with error handling."""
     try:
-        with open(CONFIG_PATH, 'r') as f:
+        with open(CONFIG_PATH, "r") as f:
             return json.load(f)
     except Exception as e:
-        log.error(f"Failed to load config file at {CONFIG_PATH}: {e}")
-        raise
+        log.error(f"Critical Error: Could not load config at {CONFIG_PATH}: {e}")
+        raise AirflowException("Gold curation failed: Config missing.")
 
 
-def curate_gold_metrics(ds: str):
+def curate_gold_metrics(ds: str, **kwargs):
     """
-    Aggregate Silver layer into daily Gold metrics (AVG, MIN, MAX, Daily Change).
-    Idempotent on (metric_date, coin_id, vs_currency).
+    Silver -> Gold Curation Layer
+
+    Produces daily business metrics:
+        • avg_price
+        • min_price
+        • max_price
+        • volatility_pct   = (max - min) / min
+        • daily_change_pct = (today_avg - yesterday_avg) / yesterday_avg
+
+    Idempotent + partitioned by metric_date.
     """
-    log.info(f"[{ds}] Starting Gold Curation")
+
+    log.info(f"[{ds}] Starting Gold Curation (Business Metrics Layer)")
 
     config = load_config()
     data_cfg = config["data_warehouse"]
-    silver_table = data_cfg.get("silver_table", "silver_clean_prices")
-    gold_table = data_cfg.get("gold_table", "gold_daily_metrics")
+
+    silver_table = data_cfg.get("silver_table")
+    gold_table = data_cfg.get("gold_table")
+
+    if not silver_table or not gold_table:
+        raise AirflowException("Gold curation failed: Missing table names in config.")
 
     hook = PostgresHook(postgres_conn_id="postgres_default")
 
-    # 🛑 FIX APPLIED HERE: Changed hook.run(..., fetch=True) to hook.get_first()
-    # The date for the previous execution date (ds - 1 day)
-    prev_ds = hook.get_first("SELECT (%s::date - INTERVAL '1 day')::date", parameters=(ds,))[0]
+    # --------------------------
+    # 1) Ensure table structure
+    # --------------------------
+    setup_sql = f"""
+    CREATE TABLE IF NOT EXISTS {gold_table} (
+        metric_date DATE NOT NULL,
+        coin_id TEXT NOT NULL,
+        vs_currency VARCHAR(10) NOT NULL,
+        avg_price NUMERIC(20,10),
+        min_price NUMERIC(20,10),
+        max_price NUMERIC(20,10),
+        volatility_pct NUMERIC(10,4),
+        daily_change_pct NUMERIC(10,4),
+        PRIMARY KEY (metric_date, coin_id, vs_currency)
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_{gold_table}_date
+        ON {gold_table} (metric_date, coin_id, vs_currency);
+    """
+    hook.run(setup_sql)
 
-    with hook.get_conn() as conn, conn.cursor() as cur:
+    # --------------------------
+    # 2) Aggregate daily metrics
+    # --------------------------
+    upsert_sql = f"""
+    WITH daily_stats AS (
+        SELECT
+            source_timestamp::date AS metric_date,
+            coin_id,
+            vs_currency,
+            AVG(price) AS avg_price,
+            MIN(price) AS min_price,
+            MAX(price) AS max_price
+        FROM {silver_table}
+        WHERE source_timestamp::date = %s::date
+        GROUP BY 1,2,3
+    ),
+    comparison AS (
+        SELECT
+            s.*,
+            g.avg_price AS prev_avg_price
+        FROM daily_stats s
+        LEFT JOIN {gold_table} g
+            ON s.coin_id = g.coin_id
+            AND s.vs_currency = g.vs_currency
+            AND g.metric_date = (%s::date - INTERVAL '1 day')::date
+    )
+    INSERT INTO {gold_table} (
+        metric_date,
+        coin_id,
+        vs_currency,
+        avg_price,
+        min_price,
+        max_price,
+        volatility_pct,
+        daily_change_pct
+    )
+    SELECT
+        metric_date,
+        coin_id,
+        vs_currency,
+        avg_price,
+        min_price,
+        max_price,
 
-        # 1️⃣ Ensure Gold table exists (Schema from previous step)
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {gold_table} (
-                metric_date DATE NOT NULL,
-                coin_id TEXT NOT NULL,
-                vs_currency TEXT NOT NULL,
-                avg_price NUMERIC,
-                min_price NUMERIC,
-                max_price NUMERIC,
-                daily_change_pct NUMERIC,
-                PRIMARY KEY (metric_date, coin_id, vs_currency)
-            );
-        """)
-        conn.commit()
+        -- Volatility = (Max − Min) / Min
+        CASE
+            WHEN min_price = 0 THEN NULL
+            ELSE ((max_price - min_price) / min_price) * 100
+        END AS volatility_pct,
 
-        # 2️⃣ Aggregate + upsert using CTE to calculate daily change
-        sql = f"""
-            WITH daily_agg AS (
-                -- Calculate current day's metrics
-                SELECT
-                    %s::date AS metric_date,
-                    coin_id,
-                    vs_currency,
-                    AVG(price) AS avg_price,
-                    MIN(price) AS min_price,
-                    MAX(price) AS max_price
-                FROM {silver_table}
-                -- Filter data for the current logical date (ds)
-                WHERE source_timestamp >= %s::date
-                  AND source_timestamp < (%s::date + INTERVAL '1 day')
-                GROUP BY coin_id, vs_currency
-            ),
-            
-            prev_day_agg AS (
-                -- Retrieve previous day's AVG price for calculating daily change
-                SELECT
-                    coin_id,
-                    vs_currency,
-                    avg_price
-                FROM {gold_table}
-                WHERE metric_date = %s::date
-            )
-            
-            INSERT INTO {gold_table} 
-                (metric_date, coin_id, vs_currency, avg_price, min_price, max_price, daily_change_pct)
-            SELECT
-                t1.metric_date,
-                t1.coin_id,
-                t1.vs_currency,
-                t1.avg_price,
-                t1.min_price,
-                t1.max_price,
-                -- Calculate Percentage Change: (Current_AVG - Prev_AVG) / Prev_AVG * 100
-                (t1.avg_price - t2.avg_price) / t2.avg_price * 100 AS daily_change_pct
-            FROM daily_agg t1
-            LEFT JOIN prev_day_agg t2 
-                ON t1.coin_id = t2.coin_id 
-                AND t1.vs_currency = t2.vs_currency
-            
-            ON CONFLICT (metric_date, coin_id, vs_currency) DO UPDATE
-            SET 
-                avg_price = EXCLUDED.avg_price,
-                min_price = EXCLUDED.min_price,
-                max_price = EXCLUDED.max_price,
-                daily_change_pct = EXCLUDED.daily_change_pct;
-        """
+        -- Daily Performance = Today vs Yesterday
+        CASE
+            WHEN prev_avg_price IS NULL OR prev_avg_price = 0 THEN 0
+            ELSE ((avg_price - prev_avg_price) / prev_avg_price) * 100
+        END AS daily_change_pct
 
-        # Execute the query, passing the current date (ds) three times and previous date once
-        cur.execute(sql, (ds, ds, ds, prev_ds))
+    FROM comparison
+    ON CONFLICT (metric_date, coin_id, vs_currency)
+    DO UPDATE SET
+        avg_price = EXCLUDED.avg_price,
+        min_price = EXCLUDED.min_price,
+        max_price = EXCLUDED.max_price,
+        volatility_pct = EXCLUDED.volatility_pct,
+        daily_change_pct = EXCLUDED.daily_change_pct;
+    """
 
-        affected = cur.rowcount
-        conn.commit()
+    hook.run(upsert_sql, parameters=(ds, ds))
 
-    log.info(f"[{ds}] Gold curation completed. Rows affected: {affected}")
-    return affected
+    log.info(f"[{ds}] Gold curation completed successfully for {gold_table}.")
