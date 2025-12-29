@@ -1,119 +1,184 @@
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from datetime import datetime
 import logging
 import json
-from psycopg2.extras import execute_batch # Import moved here for clarity
+from datetime import datetime
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.exceptions import AirflowException
+from psycopg2.extras import execute_batch
 
 log = logging.getLogger("airflow.task")
 
 CONFIG_PATH = "/opt/airflow/config/api_config.json"
 
 
+# -----------------------------
+# CONFIG LOADER
+# -----------------------------
 def load_config():
-    """Load configuration from the file path."""
-    # Added error handling for file loading
     try:
-        with open(CONFIG_PATH, 'r') as f:
+        with open(CONFIG_PATH, "r") as f:
             return json.load(f)
     except Exception as e:
-        log.error(f"Failed to load config file at {CONFIG_PATH}: {e}")
-        raise
+        log.error(f"Critical Error: Could not load config at {CONFIG_PATH}: {e}")
+        raise AirflowException("Transformation failed: Config missing.")
 
 
-def transform_and_load_silver(ds: str):
+# -----------------------------
+# PAYLOAD PARSING
+# -----------------------------
+def parse_payload(source_name, raw_payload, vs_currencies):
     """
-    Reads raw JSON from Bronze, flattens it, and loads clean, structured data 
-    into the Silver table. Idempotent on (coin_id, vs_currency, source_timestamp).
+    Normalizes API schemas into unified tuples:
+    (coin_id, currency, price)
     """
-    log.info(f"[{ds}] Starting Silver Transformation")
+
+    extracted = []
+
+    # Ensure payload is dict
+    if isinstance(raw_payload, str):
+        raw_payload = json.loads(raw_payload)
+
+    # ---------------------------
+    # CoinGecko Bronze Format:
+    # { "bitcoin": {"usd": 40000, "eur": 38000}, ... }
+    # ---------------------------
+    if source_name == "coingecko":
+
+        for coin_id, price_map in raw_payload.items():
+            for curr in vs_currencies:
+                price = price_map.get(curr.lower())
+
+                if price is None:
+                    continue
+
+                extracted.append(
+                    (coin_id, curr.upper(), float(price))
+                )
+
+    # ---------------------------
+    # CoinCap Bronze Format (your pipeline)
+    # Bronze stores records per asset, ex:
+    # {
+    #   "bitcoin": {"id": "bitcoin", "priceUsd": "40230.12"},
+    #   "ethereum": {...}
+    # }
+    # ---------------------------
+    elif source_name == "coincap":
+
+        for coin_id, data in raw_payload.items():
+
+            price = data.get("priceUsd")
+
+            if not price:
+                continue
+
+            extracted.append(
+                (coin_id, "USD", float(price))
+            )
+
+    return extracted
+
+
+
+# -----------------------------
+# SILVER TRANSFORM TASK
+# -----------------------------
+def transform_and_load_silver(ds: str, **kwargs):
+    """
+    Bronze → Silver transformation
+    - normalizes schemas
+    - inserts batch records
+    - preserves idempotency
+    """
 
     config = load_config()
-    data_cfg = config["data_warehouse"]
-    bronze_table = data_cfg.get("bronze_table", "bronze_raw_prices")
-    silver_table = data_cfg.get("silver_table", "silver_clean_prices")
-    
-    # Use the vs_currencies defined in your config for transformation
-    coingecko_cfg = config["api_source"]["coingecko"]
-    vs_currencies = coingecko_cfg.get("vs_currencies", ["usd"])
+
+    bronze_table = config["data_warehouse"]["bronze_table"]
+    silver_table = config["data_warehouse"]["silver_table"]
 
     hook = PostgresHook(postgres_conn_id="postgres_default")
 
-    # 1️⃣ Read all Bronze records for the day
-    # Retrieves the raw JSON payload and the `extracted_at` timestamp
-    records = hook.get_records(
-        f"""
-        SELECT raw_json_payload, extracted_at
+    # ---------------------------------
+    # Fetch Bronze payloads for date
+    # ---------------------------------
+    query = f"""
+        SELECT source_name, raw_json_payload, extracted_at
         FROM {bronze_table}
         WHERE logical_date = %s;
-        """,
-        parameters=(ds,)
-    )
+    """
+
+    records = hook.get_records(query, parameters=(ds,))
 
     if not records:
-        log.warning(f"[{ds}] No Bronze data found – skipping Silver load.")
+        log.warning(f"[{ds}] No Bronze records found — skipping silver stage.")
         return
 
     transformed_rows = []
-    
-    # 2️⃣ Flatten and Clean Data
-    for raw_payload, extracted_at in records:
-        # The raw_payload is already a parsed dictionary here due to hook.get_records returning a JSONB column
-        for coin_id, prices in raw_payload.items():
-            for currency in vs_currencies: # Iterate over ALL configured currencies (usd, eur, etc.)
-                if currency in prices:
-                    try:
-                        # Prepare row: (coin_id, vs_currency, price, source_timestamp, processed_timestamp)
-                        transformed_rows.append((
-                            coin_id,
-                            currency,
-                            float(prices[currency]),
-                            extracted_at,
-                            datetime.utcnow() 
-                        ))
-                    except (ValueError, TypeError) as e:
-                        # Handle case where price might be non-numeric (e.g., null or bad string)
-                        log.warning(f"Skipping record for {coin_id}/{currency} due to bad price data: {e}")
-                else:
-                    log.debug(f"[{ds}] Skipping {coin_id} for currency {currency}: not found in payload.")
+    processed_at = datetime.utcnow()
+
+    # ---------------------------------
+    # Normalize per source
+    # ---------------------------------
+    for source_name, raw_payload, extracted_at in records:
+
+        source_cfg = config["api_source"].get(source_name, {})
+        vs_currencies = source_cfg.get("vs_currencies", ["usd"])
+
+        parsed = parse_payload(source_name, raw_payload, vs_currencies)
+
+        for coin_id, currency, price in parsed:
+            transformed_rows.append((
+                coin_id,
+                currency,
+                price,
+                source_name,
+                extracted_at,
+                processed_at
+            ))
 
     if not transformed_rows:
-        log.warning(f"[{ds}] No valid Silver records produced after cleaning.")
+        log.warning(f"[{ds}] Silver transformation produced 0 rows.")
         return
 
-    log.info(f"[{ds}] Prepared {len(transformed_rows)} Silver rows for upsert.")
+    # ---------------------------------
+    # Silver Table Schema + UPSERT
+    # ---------------------------------
+    create_sql = f"""
+        CREATE TABLE IF NOT EXISTS {silver_table} (
+            coin_id TEXT NOT NULL,
+            vs_currency VARCHAR(10) NOT NULL,
+            price NUMERIC(20,10) NOT NULL,
+            source_name TEXT NOT NULL,
+            source_timestamp TIMESTAMP NOT NULL,
+            processed_timestamp TIMESTAMP,
+            PRIMARY KEY (coin_id, vs_currency, source_timestamp, source_name)
+        );
+    """
 
-    # 3️⃣ Load Data to Silver Table (Upsert)
-    with hook.get_conn() as conn, conn.cursor() as cur:
-
-        # Ensure Silver table exists. Added 'vs_currency' to the schema and PRIMARY KEY.
-        cur.execute(f"""
-            CREATE TABLE IF NOT EXISTS {silver_table} (
-                id SERIAL, -- Retained SERIAL ID, but not part of the unique key
-                coin_id TEXT NOT NULL,
-                vs_currency TEXT NOT NULL, 
-                price NUMERIC NOT NULL,
-                source_timestamp TIMESTAMP NOT NULL,
-                processed_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (coin_id, vs_currency, source_timestamp) -- Use Primary Key for efficient ON CONFLICT reference
-            );
-        """)
-        conn.commit()
-
-        # Bulk upsert query
-        execute_batch(
-            cur,
-            f"""
-            INSERT INTO {silver_table}
-            (coin_id, vs_currency, price, source_timestamp, processed_timestamp)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (coin_id, vs_currency, source_timestamp)
-            DO UPDATE SET
-                price = EXCLUDED.price,
-                processed_timestamp = EXCLUDED.processed_timestamp;
-            """,
-            transformed_rows,
-            page_size=100
+    upsert_sql = f"""
+        INSERT INTO {silver_table} (
+            coin_id, vs_currency, price,
+            source_name, source_timestamp, processed_timestamp
         )
-        conn.commit()
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (coin_id, vs_currency, source_timestamp, source_name)
+        DO UPDATE SET
+            price = EXCLUDED.price,
+            processed_timestamp = EXCLUDED.processed_timestamp;
+    """
 
-    log.info(f"[{ds}] Silver transformation completed successfully: {len(transformed_rows)} rows upserted.")
+    with hook.get_conn() as conn:
+        with conn.cursor() as cur:
+
+            cur.execute(create_sql)
+
+            execute_batch(
+                cur,
+                upsert_sql,
+                transformed_rows,
+                page_size=500
+            )
+
+    log.info(
+        f"[{ds}] Silver Load Complete — {len(transformed_rows)} rows written "
+        f"into {silver_table}"
+    )
