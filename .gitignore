@@ -1,4 +1,0 @@
-# Ignore Airflow/Docker Logs and temporary files
-logs/
-temp/
-__pycache__/
