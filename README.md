@@ -103,8 +103,7 @@ This will start:
 ## 📁 Repository Structure
 
 ```text
-crypto-pipeline-code/
-├── .gitignore
+Crypto-ETL-Pipeline/
 ├── docker-compose.yml
 ├── config/
 │   └── api_config.json
