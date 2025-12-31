@@ -136,4 +136,6 @@ Junior Data Analyst / Data Engineer
 
 ---
 
+![CI](https://github.com/mostafakhaled88/Crypto-ETL-Pipeline/actions/workflows/ci.yml/badge.svg)
+---
 ⭐ If you find this project useful, feel free to star the repository!
