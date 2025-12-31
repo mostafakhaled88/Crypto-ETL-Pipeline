@@ -1,20 +1,16 @@
 version: '3.8'
 
 x-airflow-common: &airflow-common
-  # Updated to match the likely 2.9.3 version
   image: my-crypto-airflow:2.9.3
   build: .
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    # Use variables for secrets to keep them out of your code
     AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-4OayG-pV-62T_BufLYRFg6POVN6Bcv-25PhXVNvydfI=}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
-    # Reference the service name 'postgres' directly
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
-    # Performance tuning for crypto data (increase parallelism)
     AIRFLOW__CORE__PARALLELISM: 32
     AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 1
   volumes:
@@ -30,17 +26,16 @@ x-airflow-common: &airflow-common
 
 services:
   postgres:
-    image: postgres:15-alpine # Alpine is lighter for local dev
+    image: postgres:15-alpine
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
     ports:
-      - "5433:5432"
+      - "5434:5432"
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
-      # More robust check using pg_isready
       test: ["CMD-SHELL", "pg_isready -d airflow -U airflow"]
       interval: 10s
       timeout: 5s
@@ -49,16 +44,11 @@ services:
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
-    # Added a check to wait for the DB to be ready before running migrations
     command: >
-      -c "airflow db migrate &&
-      airflow users create
-      --username admin
-      --firstname Air
-      --lastname Flow
-      --role Admin
-      --email admin@example.com
-      --password admin"
+      -c "
+      airflow db migrate &&
+      airflow users create --username admin --firstname Air --lastname Flow --role Admin --email admin@example.com --password admin || true
+      "
 
   airflow-webserver:
     <<: *airflow-common
